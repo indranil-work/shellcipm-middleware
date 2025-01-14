@@ -75,4 +75,30 @@ router.post('/users/:id/personal-details', async (req, res) => {
   }
 });
 
+// POST /api/users/:id/communications
+router.post('/users/:id/communications', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { preferences } = req.body;  // expecting an array of preferences
+
+    // Update app_metadata in Auth0
+    const updatedUser = await auth0Management.users.update({ id }, {
+      app_metadata: {
+        communications_preference: preferences || []  // if preferences is undefined, use empty array
+      }
+    });
+
+    res.json({
+      success: true,
+      user: updatedUser
+    });
+  } catch (error) {
+    console.error('Error updating communications preferences:', error);
+    res.status(500).json({ 
+      error: 'Failed to update communications preferences', 
+      details: error.message 
+    });
+  }
+});
+
 module.exports = router; 
