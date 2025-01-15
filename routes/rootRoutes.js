@@ -101,4 +101,87 @@ router.post('/users/:id/communications', async (req, res) => {
   }
 });
 
+// POST /api/users/:id/change-password
+router.post('/users/:id/change-password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { currentPassword, newPassword } = req.body;
+
+    // First verify the current password
+    const verifyPasswordResponse = await auth0Management.users.getAll({
+      q: `user_id:"${id}"`,
+      search_engine: 'v3'
+    });
+
+    if (!verifyPasswordResponse || verifyPasswordResponse.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Change the password using Auth0 Management API
+    const updatedUser = await auth0Management.users.update({ id }, {
+      password: newPassword,
+      connection: 'shelldemoconnection'  // specify your connection name
+    });
+
+    res.json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error changing password:', error);
+    res.status(500).json({ 
+      error: 'Failed to change password', 
+      details: error.message 
+    });
+  }
+});
+
+// GET /api/password-policy
+router.get('/password-policy', async (req, res) => {
+  try {
+    // Get all connections to find the shelldemoconnection
+    const response = await auth0Management.connections.getAll({
+      strategy: 'auth0'
+    });
+
+    // Find the specific connection in the data array
+    const connection = response.data.find(conn => 
+      conn.name === 'shelldemoconnection'
+    );
+
+    if (!connection) {
+      throw new Error('Database connection not found');
+    }
+
+    // Extract password policy from the connection
+    const passwordPolicy = {
+      min_length: connection.options?.password_complexity_options?.min_length || 8,
+      requires_uppercase: connection.options?.passwordPolicy === 'good',
+      requires_lowercase: connection.options?.passwordPolicy === 'good',
+      requires_numbers: connection.options?.passwordPolicy === 'good',
+      requires_symbols: connection.options?.passwordPolicy === 'good'
+    };
+
+    console.log('Extracted password policy:', {
+      connection: connection.name,
+      policy: passwordPolicy,
+      rawPasswordPolicy: connection.options?.passwordPolicy,
+      rawComplexityOptions: connection.options?.password_complexity_options
+    });
+
+    res.json({
+      success: true,
+      policy: passwordPolicy
+    });
+
+  } catch (error) {
+    console.error('Error fetching password policy:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch password policy', 
+      details: error.message 
+    });
+  }
+});
+
 module.exports = router; 
