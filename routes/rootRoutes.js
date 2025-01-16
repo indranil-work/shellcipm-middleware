@@ -184,4 +184,238 @@ router.get('/password-policy', async (req, res) => {
   }
 });
 
+// POST /api/users/:id/change-email
+router.post('/users/:id/change-email', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newEmail, password } = req.body;
+
+    // First verify the user exists
+    const user = await auth0Management.users.get({ id });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if the new email is already in use
+    const existingUsers = await auth0Management.users.getAll({
+      q: `email:"${newEmail}"`,
+      search_engine: 'v3'
+    });
+
+    if (existingUsers && existingUsers.length > 0) {
+      return res.status(400).json({ 
+        error: 'Email already in use',
+        code: 'email_exists'
+      });
+    }
+
+    // Update the email using Auth0 Management API
+    const updatedUser = await auth0Management.users.update(
+      { id }, 
+      {
+        email: newEmail,
+        email_verified: false, // Reset email verification status
+        verify_email: true,    // Trigger verification email
+        connection: 'shelldemoconnection'
+      }
+    );
+
+    console.log('Email update response:', {
+      userId: id,
+      oldEmail: user.email,
+      newEmail,
+      updatedUser
+    });
+
+    res.json({
+      success: true,
+      message: 'Email updated successfully. Please verify your new email address.',
+      user: {
+        email: newEmail,
+        email_verified: false
+      }
+    });
+
+  } catch (error) {
+    console.error('Error changing email:', error);
+    
+    // Handle specific error cases
+    if (error.message.includes('email_exists')) {
+      return res.status(400).json({ 
+        error: 'Email already in use',
+        code: 'email_exists'
+      });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to change email', 
+      details: error.message,
+      code: 'change_email_failed'
+    });
+  }
+});
+
+// GET /api/users/:id/email-settings
+router.get('/users/:id/email-settings', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get connection settings to check email verification requirements
+    const connections = await auth0Management.connections.getAll({
+      strategy: 'auth0'
+    });
+
+    const connection = connections.data.find(conn => 
+      conn.name === 'shelldemoconnection'
+    );
+
+    if (!connection) {
+      throw new Error('Database connection not found');
+    }
+
+    // Extract email settings
+    const emailSettings = {
+      requires_verification: connection.options?.requires_verification || false,
+      verification_method: connection.options?.verification?.method || 'code',
+      minimum_length: 5, // Default minimum email length
+      allowed_domains: connection.options?.allowed_domains || [],
+      blocked_domains: connection.options?.blocked_domains || []
+    };
+
+    console.log('Email settings:', {
+      connection: connection.name,
+      settings: emailSettings
+    });
+
+    res.json({
+      success: true,
+      settings: emailSettings
+    });
+
+  } catch (error) {
+    console.error('Error fetching email settings:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch email settings', 
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/users/:id/resend-email-verification
+router.post('/users/:id/resend-email-verification', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { email } = req.body;
+
+    // Verify the user exists
+    const user = await auth0Management.users.get({ id });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Trigger a new verification email
+    await auth0Management.jobs.verifyEmail({
+      user_id: id,
+      client_id: process.env.AUTH0_CLIENT_ID
+    });
+
+    res.json({
+      success: true,
+      message: 'Verification email sent successfully'
+    });
+
+  } catch (error) {
+    console.error('Error resending verification email:', error);
+    res.status(500).json({ 
+      error: 'Failed to resend verification email', 
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/users/:id/verify-password
+router.post('/users/:id/verify-password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+
+    // First verify the user exists and log the full user object
+    const userResponse = await auth0Management.users.get({ id });
+    const user = userResponse.data;  // Extract the data object
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    console.log('User details:', { 
+      userId: id, 
+      email: user.email,
+      name: user.name,
+      identities: user.identities,
+      connection: 'shelldemoconnection'
+    });
+
+    if (!user.email) {
+      throw new Error('User email not found in profile');
+    }
+
+    // Verify password using Auth0's /oauth/token endpoint
+    const tokenUrl = `https://${process.env.AUTH0_DOMAIN}/oauth/token`;
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        grant_type: 'password',
+        username: user.email,
+        password: password,
+        client_id: process.env.AUTH0_CLIENT_ID,
+        client_secret: process.env.AUTH0_CLIENT_SECRET,
+        scope: 'openid profile email',
+        realm: 'shelldemoconnection'
+      })
+    });
+
+    const data = await response.json();
+
+    console.log('Auth0 response:', {
+      status: response.status,
+      data: data
+    });
+
+    if (!response.ok) {
+      if (response.status === 401 || data.error === 'invalid_grant') {
+        return res.status(401).json({
+          error: 'Invalid password',
+          code: 'invalid_password'
+        });
+      }
+      throw new Error(data.error_description || data.error || 'Failed to verify password');
+    }
+
+    res.json({
+      success: true,
+      message: 'Password verified successfully'
+    });
+
+  } catch (error) {
+    console.error('Error verifying password:', error);
+    
+    if (error.message.includes('invalid_grant')) {
+      return res.status(401).json({
+        error: 'Invalid password',
+        code: 'invalid_password'
+      });
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to verify password', 
+      details: error.message 
+    });
+  }
+});
+
 module.exports = router; 
