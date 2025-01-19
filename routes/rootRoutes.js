@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const rootMiddleware = require('../middleware/rootMiddleware');
 const auth0Management = require('../config/auth0');
+const QRCode = require('qrcode');
 
 // Apply middleware to all routes in this router
 router.use(rootMiddleware);
@@ -341,80 +342,381 @@ router.post('/users/:id/verify-password', async (req, res) => {
     const { id } = req.params;
     const { password } = req.body;
 
-    // First verify the user exists and log the full user object
+    // First verify the user exists
     const userResponse = await auth0Management.users.get({ id });
-    const user = userResponse.data;  // Extract the data object
+    const user = userResponse.data;
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    console.log('User details:', { 
-      userId: id, 
-      email: user.email,
-      name: user.name,
-      identities: user.identities,
-      connection: 'shelldemoconnection'
-    });
-
-    if (!user.email) {
-      throw new Error('User email not found in profile');
-    }
-
-    // Verify password using Auth0's /oauth/token endpoint
-    const tokenUrl = `https://${process.env.AUTH0_DOMAIN}/oauth/token`;
-    const response = await fetch(tokenUrl, {
+    // Get MFA token using password grant
+    const tokenResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         grant_type: 'password',
         username: user.email,
         password: password,
         client_id: process.env.AUTH0_CLIENT_ID,
         client_secret: process.env.AUTH0_CLIENT_SECRET,
-        scope: 'openid profile email',
-        realm: 'shelldemoconnection'
+        audience: `https://${process.env.AUTH0_DOMAIN}/mfa/`,
+        scope: 'enroll read:authenticators remove:authenticators'
+      })
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (tokenData.error === 'mfa_required') {
+      // If MFA is required, return the mfa_token
+      res.json({
+        success: true,
+        mfa_token: tokenData.mfa_token
+      });
+    } else if (!tokenResponse.ok) {
+      throw new Error(tokenData.error_description || 'Invalid password');
+    } else {
+      // If no MFA required, return the access token
+      res.json({
+        success: true,
+        mfa_token: tokenData.access_token
+      });
+    }
+
+  } catch (error) {
+    console.error('Error verifying password:', error);
+    res.status(401).json({ 
+      error: 'Password verification failed', 
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/users/:id/start-mfa-enrollment
+router.post('/users/:id/start-mfa-enrollment', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const mfaToken = req.headers.authorization?.split(' ')[1];
+
+    if (!mfaToken) {
+      throw new Error('No MFA token provided');
+    }
+
+    console.log('Starting MFA enrollment with token:', mfaToken);
+
+    // Start MFA enrollment using the token from password verification
+    const mfaResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/mfa/associate`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${mfaToken}`
+      },
+      body: JSON.stringify({
+        authenticator_types: ['otp'],
+        otp_token: {
+          token_type: 'totp'
+        }
+      })
+    });
+
+    const responseData = await mfaResponse.json();
+    console.log('MFA response:', {
+      status: mfaResponse.status,
+      statusText: mfaResponse.statusText,
+      data: responseData
+    });
+
+    if (!mfaResponse.ok) {
+      throw new Error(responseData.message || responseData.error_description || 'Failed to start MFA enrollment');
+    }
+
+    // Generate QR code data URL
+    const qrCodeDataUrl = await QRCode.toDataURL(responseData.barcode_uri);
+
+    console.log('MFA enrollment started:', responseData);
+
+    res.json({
+      success: true,
+      barcode_uri: qrCodeDataUrl, // Send the QR code data URL instead of the URI
+      secret: responseData.secret,
+      otp_token: responseData.otp_token
+    });
+
+  } catch (error) {
+    console.error('Error starting MFA enrollment:', error);
+    res.status(500).json({ 
+      error: 'Failed to start MFA enrollment', 
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/users/:id/verify-mfa-enrollment
+router.post('/users/:id/verify-mfa-enrollment', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { verificationCode } = req.body;
+    const mfaToken = req.headers.authorization?.split(' ')[1];
+
+    if (!verificationCode || !mfaToken) {
+      throw new Error('Verification code and MFA token are required');
+    }
+
+    console.log('Verifying MFA enrollment:', {
+      verificationCode,
+      mfaToken
+    });
+
+    // Verify the MFA code
+    const verifyResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'http://auth0.com/oauth/grant-type/mfa-otp',
+        client_id: process.env.AUTH0_CLIENT_ID,
+        client_secret: process.env.AUTH0_CLIENT_SECRET,
+        mfa_token: mfaToken,
+        otp: verificationCode
+      })
+    });
+
+    const responseData = await verifyResponse.json();
+    console.log('Verification response:', {
+      status: verifyResponse.status,
+      statusText: verifyResponse.statusText,
+      data: responseData
+    });
+
+    if (!verifyResponse.ok) {
+      throw new Error(responseData.error_description || 'Failed to verify MFA code');
+    }
+
+    console.log('MFA verification successful');
+
+    res.json({
+      success: true,
+      message: 'MFA enrollment completed successfully'
+    });
+
+  } catch (error) {
+    console.error('Error verifying MFA enrollment:', error);
+    res.status(500).json({ 
+      error: 'Failed to verify MFA enrollment', 
+      details: error.message 
+    });
+  }
+});
+
+// POST /api/users/:id/deactivate-mfa
+router.post('/users/:id/deactivate-mfa', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get user's enrollments to verify they have an authenticator
+    const enrollments = await auth0Management.users.getEnrollments({ id });
+    
+    console.log('Found enrollments:', enrollments);
+    
+    // Find the authenticator enrollment
+    const authenticatorEnrollment = enrollments.data.find(
+      enrollment => enrollment.type === 'authenticator' || 
+                   enrollment.auth_method === 'authenticator'
+    );
+    
+    if (!authenticatorEnrollment) {
+      throw new Error('No authenticator enrollment found');
+    }
+
+    // Delete the authenticator enrollment using the Management API
+    await auth0Management.guardian.deleteGuardianEnrollment(authenticatorEnrollment);
+
+    res.json({
+      success: true,
+      message: 'Authenticator app removed successfully'
+    });
+
+  } catch (error) {
+    console.error('Error deactivating MFA:', error);
+    res.status(500).json({ 
+      error: 'Failed to deactivate MFA', 
+      details: error.message 
+    });
+  }
+});
+
+// GET /api/users/:id/authenticator-status
+router.get('/users/:id/authenticator-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get user's factors using the Management API
+    const response = await auth0Management.users.getEnrollments({ id });
+    const enrollments = response.data;
+    
+    console.log('Enrollments:', enrollments);
+
+    // Check if user has an OTP authenticator enrollment
+    const hasAuthenticator = enrollments && 
+                           Array.isArray(enrollments) && 
+                           enrollments.some(enrollment => 
+                             enrollment.type === 'authenticator' || 
+                             enrollment.auth_method === 'authenticator'
+                           );
+
+    res.json({
+      hasAuthenticator,
+      debug: enrollments
+    });
+
+  } catch (error) {
+    console.error('Error checking authenticator status:', error);
+    res.status(500).json({ 
+      error: 'Failed to check authenticator status', 
+      details: error.message 
+    });
+  }
+});
+
+// Helper function to get management token
+const getManagementToken = async () => {
+  try {
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        client_id: process.env.AUTH0_CLIENT_ID,
+        client_secret: process.env.AUTH0_CLIENT_SECRET,
+        audience: `https://${process.env.AUTH0_DOMAIN}/api/v2/`,
+        grant_type: 'client_credentials'
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to get management token');
+    }
+
+    const data = await response.json();
+    return data.access_token;
+  } catch (error) {
+    throw error;
+  }
+};
+
+// Helper function to get client secret
+const getClientSecret = async (client_id) => {
+  try {
+    const managementToken = await getManagementToken();
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/clients/${client_id}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch client secret');
+    }
+
+    const data = await response.json();
+    return data.client_secret;
+  } catch (error) {
+    throw error;
+  }
+};
+
+// POST /auth0/passwordless/start
+router.post('/auth0/passwordless/start', async (req, res) => {
+  try {
+    const { email, client_id } = req.body;
+
+    // First get the client secret
+    const client_secret = await getClientSecret(client_id);
+
+    // Then start passwordless flow
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/passwordless/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        client_id,
+        client_secret,
+        connection: 'email',
+        email,
+        send: 'code'
       })
     });
 
     const data = await response.json();
-
-    console.log('Auth0 response:', {
-      status: response.status,
-      data: data
-    });
-
     if (!response.ok) {
-      if (response.status === 401 || data.error === 'invalid_grant') {
-        return res.status(401).json({
-          error: 'Invalid password',
-          code: 'invalid_password'
-        });
-      }
-      throw new Error(data.error_description || data.error || 'Failed to verify password');
+      throw new Error(data.error_description || data.error || 'Failed to start passwordless flow');
     }
 
-    res.json({
-      success: true,
-      message: 'Password verified successfully'
-    });
-
+    res.json({ message: 'Verification code sent successfully' });
   } catch (error) {
-    console.error('Error verifying password:', error);
-    
-    if (error.message.includes('invalid_grant')) {
-      return res.status(401).json({
-        error: 'Invalid password',
-        code: 'invalid_password'
-      });
+    console.error('Error in passwordless start:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /auth0/passwordless/verify
+router.post('/auth0/passwordless/verify', async (req, res) => {
+  try {
+    const { email, code, client_id, user_id } = req.body;
+    const managementToken = await getManagementToken();
+
+    // First get the client secret
+    const client_secret = await getClientSecret(client_id);
+
+    // Then verify the code
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        grant_type: 'http://auth0.com/oauth/grant-type/passwordless/otp',
+        client_id,
+        client_secret,
+        username: email,
+        otp: code,
+        realm: 'email',
+        scope: 'openid profile email'
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error_description || data.error || 'Invalid verification code');
     }
 
-    res.status(500).json({ 
-      error: 'Failed to verify password', 
-      details: error.message 
+    // Update user's app_metadata with nested two-step-enabled flag
+    const updateResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        app_metadata: {
+          [client_id]: {
+            'two-step-enabled': true
+          }
+        }
+      })
     });
+
+    if (!updateResponse.ok) {
+      throw new Error('Failed to update user metadata');
+    }
+
+    res.json({ message: 'Two-step verification enabled successfully' });
+  } catch (error) {
+    console.error('Error in passwordless verify:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
