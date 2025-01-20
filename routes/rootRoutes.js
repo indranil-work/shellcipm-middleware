@@ -455,7 +455,7 @@ router.post('/users/:id/start-mfa-enrollment', async (req, res) => {
 router.post('/users/:id/verify-mfa-enrollment', async (req, res) => {
   try {
     const { id } = req.params;
-    const { verificationCode } = req.body;
+    const { verificationCode, client_id } = req.body;
     const mfaToken = req.headers.authorization?.split(' ')[1];
 
     if (!verificationCode || !mfaToken) {
@@ -491,6 +491,43 @@ router.post('/users/:id/verify-mfa-enrollment', async (req, res) => {
       throw new Error(responseData.error_description || 'Failed to verify MFA code');
     }
 
+    // Get management token
+    const managementToken = await getManagementToken();
+
+    // Get current app_metadata first
+    const userResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${id}`, {
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const userData = await userResponse.json();
+    const appMetadata = userData.app_metadata || {};
+    const clientMetadata = appMetadata[client_id] || {};
+
+    // Update only the authenticator-enabled flag
+    const updateResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        app_metadata: {
+          ...appMetadata,
+          [client_id]: {
+            ...clientMetadata,
+            'authenticator-enabled': true
+          }
+        }
+      })
+    });
+
+    if (!updateResponse.ok) {
+      throw new Error('Failed to update user metadata');
+    }
+
     console.log('MFA verification successful');
 
     res.json({
@@ -511,6 +548,8 @@ router.post('/users/:id/verify-mfa-enrollment', async (req, res) => {
 router.post('/users/:id/deactivate-mfa', async (req, res) => {
   try {
     const { id } = req.params;
+
+    const { client_id } = req.body;
     
     // Get user's enrollments to verify they have an authenticator
     const enrollments = await auth0Management.users.getEnrollments({ id });
@@ -529,6 +568,39 @@ router.post('/users/:id/deactivate-mfa', async (req, res) => {
 
     // Delete the authenticator enrollment using the Management API
     await auth0Management.guardian.deleteGuardianEnrollment(authenticatorEnrollment);
+
+    // Get management token for metadata update
+    const managementToken = await getManagementToken();
+
+    // Get current app_metadata first
+    const userResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${id}`, {
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const userData = await userResponse.json();
+    const appMetadata = userData.app_metadata || {};
+    const clientMetadata = appMetadata[client_id] || {};
+
+    // Update only the authenticator-enabled flag
+    await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        app_metadata: {
+          ...appMetadata,
+          [client_id]: {
+            ...clientMetadata,
+            'authenticator-enabled': false
+          }
+        }
+      })
+    });
 
     res.json({
       success: true,
@@ -693,7 +765,19 @@ router.post('/auth0/passwordless/verify', async (req, res) => {
       throw new Error(data.error_description || data.error || 'Invalid verification code');
     }
 
-    // Update user's app_metadata with nested two-step-enabled flag
+    // Get current app_metadata first
+    const userResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const userData = await userResponse.json();
+    const appMetadata = userData.app_metadata || {};
+    const clientMetadata = appMetadata[client_id] || {};
+
+    // Update only the two-step-enabled flag
     const updateResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
       method: 'PATCH',
       headers: {
@@ -702,7 +786,9 @@ router.post('/auth0/passwordless/verify', async (req, res) => {
       },
       body: JSON.stringify({
         app_metadata: {
+          ...appMetadata,
           [client_id]: {
+            ...clientMetadata,
             'two-step-enabled': true
           }
         }
