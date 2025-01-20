@@ -720,4 +720,77 @@ router.post('/auth0/passwordless/verify', async (req, res) => {
   }
 });
 
+// POST /auth0/revoke-access
+router.post('/auth0/revoke-access', async (req, res) => {
+  try {
+    const { user_id, client_id } = req.body;
+    const managementToken = await getManagementToken();
+
+    // First get the user's current app_metadata
+    const userResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!userResponse.ok) {
+      throw new Error('Failed to fetch user data');
+    }
+
+    const userData = await userResponse.json();
+    const appMetadata = userData.app_metadata || {};
+    const allowedApps = appMetadata.allowed_apps || [];
+
+    // Remove current client_id from allowed_apps
+    const updatedAllowedApps = allowedApps.filter(app => app !== client_id);
+
+    // Check if user has any other applications
+    const hasOtherApps = updatedAllowedApps.length > 0;
+
+    if (hasOtherApps) {
+      // Update app_metadata with filtered allowed_apps and remove client_id specific data
+      const updateResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${managementToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          app_metadata: {
+            ...appMetadata,
+            allowed_apps: updatedAllowedApps
+          }
+        })
+      });
+
+      if (!updateResponse.ok) {
+        throw new Error('Failed to update user metadata');
+      }
+    } else {
+      // Delete the user account if no other applications
+      const deleteResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${managementToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!deleteResponse.ok) {
+        throw new Error('Failed to delete user account');
+      }
+    }
+
+    res.json({ 
+      message: hasOtherApps ? 
+        'Access revoked successfully' : 
+        'Account deleted successfully' 
+    });
+  } catch (error) {
+    console.error('Error in revoke access:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router; 
