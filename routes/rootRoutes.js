@@ -879,4 +879,50 @@ router.post('/auth0/revoke-access', async (req, res) => {
   }
 });
 
+// POST /auth0/signout-devices
+router.post('/auth0/signout-devices', async (req, res) => {
+  try {
+    const { user_id, client_id } = req.body;
+    const managementToken = await getManagementToken();
+
+    // First get current sessions for debugging
+    const sessionsResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}/sessions`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!sessionsResponse.ok) {
+      throw new Error('Failed to fetch sessions');
+    }
+
+    const sessions = await sessionsResponse.json();
+    console.log('Current sessions before deletion:', sessions);
+
+    // Delete all sessions
+    const deleteResponse = await fetch(`https://${process.env.AUTH0_DOMAIN}/api/v2/users/${user_id}/sessions`, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${managementToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!deleteResponse.ok) {
+      throw new Error('Failed to delete sessions');
+    }
+
+    console.log('All sessions deleted successfully');
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error signing out from all devices:', error);
+    res.status(500).json({ 
+      error: 'Failed to sign out from all devices', 
+      details: error.message 
+    });
+  }
+});
+
 module.exports = router; 
